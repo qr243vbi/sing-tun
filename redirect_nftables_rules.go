@@ -274,10 +274,11 @@ func (r *autoRedirect) nftablesCreateExcludeRules(nft *nftables.Conn, table *nft
 		if len(r.tunOptions.IncludeInterface) > 0 {
 			if len(r.tunOptions.IncludeInterface) > 1 {
 				includeInterface := &nftables.Set{
-					Table:     table,
-					Anonymous: true,
-					Constant:  true,
-					KeyType:   nftables.TypeIFName,
+					Table:        table,
+					Anonymous:    true,
+					Constant:     true,
+					KeyType:      nftables.TypeIFName,
+					KeyByteOrder: binaryutil.NativeEndian,
 				}
 				err := nft.AddSet(includeInterface, common.Map(r.tunOptions.IncludeInterface, func(it string) nftables.SetElement {
 					return nftables.SetElement{
@@ -327,10 +328,11 @@ func (r *autoRedirect) nftablesCreateExcludeRules(nft *nftables.Conn, table *nft
 		if len(r.tunOptions.ExcludeInterface) > 0 {
 			if len(r.tunOptions.ExcludeInterface) > 1 {
 				excludeInterface := &nftables.Set{
-					Table:     table,
-					Anonymous: true,
-					Constant:  true,
-					KeyType:   nftables.TypeIFName,
+					Table:        table,
+					Anonymous:    true,
+					Constant:     true,
+					KeyType:      nftables.TypeIFName,
+					KeyByteOrder: binaryutil.NativeEndian,
 				}
 				err := nft.AddSet(excludeInterface, common.Map(r.tunOptions.ExcludeInterface, func(it string) nftables.SetElement {
 					return nftables.SetElement{
