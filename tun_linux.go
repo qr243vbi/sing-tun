@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"os/exec"
 	"runtime"
 	"sync"
 	"syscall"
@@ -1077,7 +1076,7 @@ func (t *NativeTun) setSearchDomainForSystemdResolved() {
 	if t.options.EXP_DisableDNSHijack {
 		return
 	}
-	ctlPath, err := exec.LookPath("resolvectl")
+	ctlPath, err := getResolveCtl()
 	if err != nil {
 		return
 	}
@@ -1104,7 +1103,7 @@ func (t *NativeTun) unsetSearchDomainForSystemdResolved() {
 	if t.options.EXP_DisableDNSHijack {
 		return
 	}
-	ctlPath, err := exec.LookPath("resolvectl")
+	ctlPath, err := getResolveCtl()
 	if err != nil {
 		return
 	}
