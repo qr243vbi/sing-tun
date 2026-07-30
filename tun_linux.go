@@ -1190,12 +1190,21 @@ func (t *NativeTun) routeUpdate(_ *control.Interface, flags int) {
 	}
 }
 
+var ResolveCtl func(args ...string) error = func(args ...string) error {
+	path, err := exec.LookPath("resolvectl")
+	if err == nil {
+		if len(args) > 0 {
+			return shell.Exec(path, args...).Run()
+		}
+	}
+	return err
+}
+
 func (t *NativeTun) setSearchDomainForSystemdResolved() {
 	if t.options.EXP_DisableDNSHijack {
 		return
 	}
-	ctlPath, err := exec.LookPath("resolvectl")
-	if err != nil {
+	if ResolveCtl() != nil {
 		return
 	}
 	dnsServer := t.options.DNSServers
@@ -1211,9 +1220,9 @@ func (t *NativeTun) setSearchDomainForSystemdResolved() {
 		return
 	}
 	go func() {
-		_ = shell.Exec(ctlPath, "domain", t.options.Name, "~.").Run()
-		_ = shell.Exec(ctlPath, "default-route", t.options.Name, "true").Run()
-		_ = shell.Exec(ctlPath, append([]string{"dns", t.options.Name}, common.Map(dnsServer, netip.Addr.String)...)...).Run()
+		_ = ResolveCtl("domain", t.options.Name, "~.")
+		_ = ResolveCtl("default-route", t.options.Name, "true")
+		_ = ResolveCtl(append([]string{"dns", t.options.Name}, common.Map(dnsServer, netip.Addr.String)...)...)
 	}()
 }
 
@@ -1221,9 +1230,5 @@ func (t *NativeTun) unsetSearchDomainForSystemdResolved() {
 	if t.options.EXP_DisableDNSHijack {
 		return
 	}
-	ctlPath, err := exec.LookPath("resolvectl")
-	if err != nil {
-		return
-	}
-	_ = shell.Exec(ctlPath, "revert", t.options.Name).Run()
+	_ = ResolveCtl("revert", t.options.Name)
 }
