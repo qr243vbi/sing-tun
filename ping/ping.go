@@ -6,10 +6,11 @@ import (
 	"net/netip"
 	"reflect"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/sing-tun/internal/gtcpip/header"
+	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
@@ -21,20 +22,27 @@ import (
 )
 
 type Conn struct {
-	ctx         context.Context
-	privileged  bool
-	conn        net.Conn
-	destination netip.Addr
-	source      common.TypedValue[netip.Addr]
-	closed      atomic.Bool
-	readMsg     func(b, oob []byte) (n, oobn int, addr netip.Addr, err error)
+	ctx          context.Context
+	privileged   bool
+	conn         net.Conn
+	controlConn  net.Conn
+	destination  netip.Addr
+	source       common.TypedValue[netip.Addr]
+	closed       atomic.Bool
+	identFilter  identFilterState
+	readMsg      func(b, oob []byte) (n, oobn int, addr netip.Addr, err error)
+	writeAccess  sync.Mutex
+	lastTTL      int
+	lastHopLimit int
 }
 
 func Connect(ctx context.Context, privileged bool, controlFunc control.Func, destination netip.Addr, idleTimeout time.Duration) (*Conn, error) {
 	c := &Conn{
-		ctx:         ctx,
-		privileged:  privileged,
-		destination: destination,
+		ctx:          ctx,
+		privileged:   privileged,
+		destination:  destination,
+		lastTTL:      -1,
+		lastHopLimit: -1,
 	}
 	err := c.connect(controlFunc, idleTimeout)
 	if err != nil {
@@ -53,6 +61,7 @@ func (c *Conn) connect(controlFunc control.Func, idleTimeout time.Duration) (err
 		return err
 	}
 	if ipConn, isIPConn := common.Cast[*net.IPConn](c.conn); isIPConn {
+		c.controlConn = ipConn
 		c.readMsg = func(b, oob []byte) (n, oobn int, addr netip.Addr, err error) {
 			var ipAddr *net.IPAddr
 			n, oobn, _, ipAddr, err = ipConn.ReadMsgIP(b, oob)
@@ -62,6 +71,7 @@ func (c *Conn) connect(controlFunc control.Func, idleTimeout time.Duration) (err
 			return
 		}
 	} else if udpConn, isUDPConn := common.Cast[*net.UDPConn](c.conn); isUDPConn {
+		c.controlConn = udpConn
 		c.readMsg = func(b, oob []byte) (n, oobn int, addr netip.Addr, err error) {
 			var addrPort netip.AddrPort
 			n, oobn, _, addrPort, err = udpConn.ReadMsgUDPAddrPort(b, oob)
@@ -255,25 +265,36 @@ func (c *Conn) ReadICMP(buffer *buf.Buffer) error {
 
 func (c *Conn) WriteIP(buffer *buf.Buffer) error {
 	defer buffer.Release()
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if !c.destination.Is6() {
 		ipHdr := header.IPv4(buffer.Bytes())
 		if !c.isLinuxUnprivileged() {
-			err := ipv4.NewConn(c.conn).SetTTL(int(ipHdr.TTL()))
-			if err != nil {
-				return err
+			ttl := int(ipHdr.TTL())
+			if ttl != c.lastTTL {
+				err := ipv4.NewConn(c.controlConn).SetTTL(ttl)
+				if err != nil {
+					return err
+				}
+				c.lastTTL = ttl
 			}
 			icmpHdr := header.ICMPv4(ipHdr.Payload())
 			icmpHdr.SetIdent(^icmpHdr.Ident())
 			icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
+			c.updateIdentFilter(icmpHdr.Ident())
 		}
 		c.source.Store(M.AddrFromIP(ipHdr.SourceAddressSlice()))
 		return common.Error(c.conn.Write(ipHdr.Payload()))
 	} else {
 		ipHdr := header.IPv6(buffer.Bytes())
 		if !c.isLinuxUnprivileged() {
-			err := ipv6.NewConn(c.conn).SetHopLimit(int(ipHdr.HopLimit()))
-			if err != nil {
-				return err
+			hopLimit := int(ipHdr.HopLimit())
+			if hopLimit != c.lastHopLimit {
+				err := ipv6.NewConn(c.controlConn).SetHopLimit(hopLimit)
+				if err != nil {
+					return err
+				}
+				c.lastHopLimit = hopLimit
 			}
 			icmpHdr := header.ICMPv6(ipHdr.Payload())
 			icmpHdr.SetIdent(^icmpHdr.Ident())
@@ -282,6 +303,7 @@ func (c *Conn) WriteIP(buffer *buf.Buffer) error {
 				Src:    ipHdr.SourceAddressSlice(),
 				Dst:    ipHdr.DestinationAddressSlice(),
 			}))
+			c.updateIdentFilter(icmpHdr.Ident())
 		}
 		c.source.Store(M.AddrFromIP(ipHdr.SourceAddressSlice()))
 		return common.Error(c.conn.Write(ipHdr.Payload()))

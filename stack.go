@@ -12,16 +12,19 @@ import (
 	"github.com/sagernet/sing/common/logger"
 )
 
-var (
-	ErrDrop   = E.New("drop by rule")
-	ErrReset  = E.New("reset by rule")
-	ErrBypass = E.New("bypass by rule")
-)
-
 type Stack interface {
 	Start() error
+	ResetNetwork()
 	Close() error
 }
+
+type MemoryPressure uint8
+
+const (
+	MemoryPressureNone MemoryPressure = iota
+	MemoryPressureWarning
+	MemoryPressureCritical
+)
 
 type StackOptions struct {
 	Context                context.Context
@@ -29,11 +32,16 @@ type StackOptions struct {
 	TunOptions             Options
 	UDPTimeout             time.Duration
 	ICMPTimeout            time.Duration
+	UDPMapping             NATMapping
+	UDPFiltering           NATFiltering
+	UDPNATMax              uint32
 	Handler                Handler
 	Logger                 logger.Logger
 	ForwarderBindInterface bool
 	IncludeAllNetworks     bool
 	InterfaceFinder        control.InterfaceFinder
+	MemoryPressure         func() MemoryPressure
+	TCPCongestionControl   string
 }
 
 func NewStack(
@@ -41,14 +49,8 @@ func NewStack(
 	options StackOptions,
 ) (Stack, error) {
 	switch stack {
-	case "":
-		if options.IncludeAllNetworks {
-			return NewGVisor(options)
-		} else if WithGVisor && !options.TunOptions.GSO {
-			return NewMixed(options)
-		} else {
-			return NewSystem(options)
-		}
+	case "", "go":
+		return NewGo(options)
 	case "gvisor":
 		return NewGVisor(options)
 	case "mixed":

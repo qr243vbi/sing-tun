@@ -3,19 +3,20 @@ package tun
 import (
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
 
 	"github.com/sagernet/netlink"
-	"github.com/sagernet/sing-tun/internal/gtcpip/checksum"
-	"github.com/sagernet/sing-tun/internal/gtcpip/header"
+	"github.com/sagernet/sing-tun/gtcpip/checksum"
+	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -38,6 +39,7 @@ type NativeTun struct {
 	readAccess          sync.Mutex
 	writeAccess         sync.Mutex
 	vnetHdr             bool
+	multiQueue          bool
 	writeBuffer         []byte
 	readRawConn         syscall.RawConn
 	pendingBuffer       []byte
@@ -51,37 +53,39 @@ type NativeTun struct {
 }
 
 func New(options Options) (Tun, error) {
-	var nativeTun *NativeTun
 	if options.FileDescriptor == 0 {
-		tunFd, err := open(options.Name, options.GSO)
-		if err != nil {
-			return nil, E.Cause(err, "open tun")
-		}
-		tunLink, err := netlink.LinkByName(options.Name)
-		if err != nil {
-			return nil, E.Errors(err, unix.Close(tunFd))
-		}
-		nativeTun = &NativeTun{
-			tunFd:   tunFd,
-			tunFile: os.NewFile(uintptr(tunFd), "tun"),
-			options: options,
-		}
-		err = nativeTun.configure(tunLink)
-		if err != nil {
-			return nil, E.Errors(err, unix.Close(tunFd))
-		}
-	} else {
-		nativeTun = &NativeTun{
-			tunFd:   options.FileDescriptor,
-			tunFile: os.NewFile(uintptr(options.FileDescriptor), "tun"),
-			options: options,
-		}
-		if options.GSO {
-			err := nativeTun.enableGSO()
+		return execInNetworkNamespace(options.NetNs, func() (Tun, error) {
+			tunFd, multiQueue, err := open(options.Name, options.GSO, options.MultiQueue)
 			if err != nil {
-				if options.Logger != nil {
-					options.Logger.Warn(err)
-				}
+				return nil, E.Cause(err, "open tun")
+			}
+			tunLink, err := netlink.LinkByName(options.Name)
+			if err != nil {
+				return nil, E.Errors(err, unix.Close(tunFd))
+			}
+			nativeTun := &NativeTun{
+				tunFd:      tunFd,
+				tunFile:    os.NewFile(uintptr(tunFd), "tun"),
+				options:    options,
+				multiQueue: multiQueue,
+			}
+			err = nativeTun.configure(tunLink)
+			if err != nil {
+				return nil, E.Errors(err, unix.Close(tunFd))
+			}
+			return nativeTun, nil
+		})
+	}
+	nativeTun := &NativeTun{
+		tunFd:   options.FileDescriptor,
+		tunFile: os.NewFile(uintptr(options.FileDescriptor), "tun"),
+		options: options,
+	}
+	if options.GSO {
+		err := nativeTun.enableGSO()
+		if err != nil {
+			if options.Logger != nil {
+				options.Logger.Warn(err)
 			}
 		}
 	}
@@ -100,7 +104,30 @@ func init() {
 	}
 }
 
-func open(name string, vnetHdr bool) (int, error) {
+// A persistent device created without IFF_MULTI_QUEUE refuses the flag with EINVAL
+// (tun_set_iff), so the plain flags are retried and such a device stays single-queue.
+func open(name string, vnetHdr bool, multiQueue bool) (int, bool, error) {
+	flags := unix.IFF_TUN | unix.IFF_NO_PI
+	if vnetHdr {
+		flags |= unix.IFF_VNET_HDR
+	}
+	if multiQueue {
+		fd, err := openTun(name, flags|unix.IFF_MULTI_QUEUE)
+		if err == nil {
+			return fd, true, nil
+		}
+		if !errors.Is(err, unix.EINVAL) {
+			return -1, false, err
+		}
+	}
+	fd, err := openTun(name, flags)
+	if err != nil {
+		return -1, false, err
+	}
+	return fd, false, nil
+}
+
+func openTun(name string, flags int) (int, error) {
 	fd, err := unix.Open(controlPath, unix.O_RDWR, 0)
 	if err != nil {
 		return -1, E.Cause(err, "open ", controlPath)
@@ -108,22 +135,38 @@ func open(name string, vnetHdr bool) (int, error) {
 	ifr, err := unix.NewIfreq(name)
 	if err != nil {
 		unix.Close(fd)
-		return 0, E.Cause(err, "create ifreq")
-	}
-	flags := unix.IFF_TUN | unix.IFF_NO_PI
-	if vnetHdr {
-		flags |= unix.IFF_VNET_HDR
+		return -1, E.Cause(err, "create ifreq")
 	}
 	ifr.SetUint16(uint16(flags))
 	err = unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr)
 	if err != nil {
 		unix.Close(fd)
-		return 0, E.Cause(err, "TUNSETIFF")
+		return -1, E.Cause(err, "TUNSETIFF")
 	}
 	err = unix.SetNonblock(fd, true)
 	if err != nil {
 		unix.Close(fd)
-		return 0, E.Cause(err, "set nonblock")
+		return -1, E.Cause(err, "set nonblock")
+	}
+	return fd, nil
+}
+
+func (t *NativeTun) openQueue() (int, error) {
+	if !t.multiQueue {
+		return -1, E.New("tun device is not multi-queue")
+	}
+	flags := unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_MULTI_QUEUE
+	if t.options.GSO {
+		flags |= unix.IFF_VNET_HDR
+	}
+	var fd int
+	err := runInNetworkNamespace(t.options.NetNs, func() error {
+		var openErr error
+		fd, openErr = openTun(t.options.Name, flags)
+		return openErr
+	})
+	if err != nil {
+		return -1, err
 	}
 	return fd, nil
 }
@@ -198,8 +241,6 @@ func (t *NativeTun) enableGSO() error {
 		return E.Cause(err, "enable offload: IFF_VNET_HDR not enabled")
 	}
 	t.vnetHdr = true
-	t.writeBuffer = make([]byte, virtioNetHdrLen+gsoMaxSize)
-	t.pendingBuffer = make([]byte, virtioNetHdrLen+gsoMaxSize)
 	t.tcpGROTable = newTCPGROTable()
 	t.udpGROTable = newUDPGROTable()
 	err = setTCPOffload(t.tunFd)
@@ -290,10 +331,10 @@ func (t *NativeTun) Name() (string, error) {
 
 func (t *NativeTun) Start() error {
 	if t.options.FileDescriptor == 0 {
-		if !t.options.EXP_ExternalConfiguration {
+		if !t.options.EXP_ExternalConfiguration && t.options.NetNs == "" {
 			t.options.InterfaceMonitor.RegisterMyInterface(t.options.Name)
 		}
-		err := t.start()
+		err := runInNetworkNamespace(t.options.NetNs, t.start)
 		if err != nil {
 			return err
 		}
@@ -328,16 +369,31 @@ func (t *NativeTun) start() error {
 		return nil
 	}
 
-	_ = os.WriteFile("/proc/sys/net/ipv4/conf/"+t.options.Name+"/rp_filter", []byte("2"), 0o644)
+	// The kernel uses max(all, interface) as the effective rp_filter value, so
+	// writing loose mode here relaxes an inherited strict mode but tightens a
+	// disabled one, where loose mode still drops replies whose source has no
+	// route on any interface.
+	rpFilter := 0
+	for _, procPath := range []string{
+		"/proc/sys/net/ipv4/conf/all/rp_filter",
+		"/proc/sys/net/ipv4/conf/" + t.options.Name + "/rp_filter",
+	} {
+		content, readErr := os.ReadFile(procPath)
+		if readErr != nil {
+			continue
+		}
+		value, parseErr := strconv.Atoi(strings.TrimSpace(string(content)))
+		if parseErr != nil {
+			continue
+		}
+		rpFilter = max(rpFilter, value)
+	}
+	if rpFilter == 1 {
+		_ = os.WriteFile("/proc/sys/net/ipv4/conf/"+t.options.Name+"/rp_filter", []byte("2"), 0o644)
+	}
 
 	if t.options.IPRoute2TableIndex == 0 {
-		for {
-			t.options.IPRoute2TableIndex = int(rand.Uint32())
-			routeList, fErr := netlink.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{Table: t.options.IPRoute2TableIndex}, netlink.RT_FILTER_TABLE)
-			if len(routeList) == 0 || fErr != nil {
-				break
-			}
-		}
+		t.options.IPRoute2TableIndex = chooseRouteTableIndex()
 	}
 
 	err = t.setRoute(tunLink)
@@ -356,7 +412,12 @@ func (t *NativeTun) start() error {
 		return E.Cause(err, "set rules")
 	}
 
-	t.setSearchDomainForSystemdResolved()
+	if t.options.DNSMode != DNSModeDisabled && t.options.NetNs == "" {
+		err = t.setSearchDomainForSystemdResolved()
+		if err != nil {
+			return E.Cause(err, "set search domain")
+		}
+	}
 
 	if t.options.AutoRoute && runtime.GOOS == "android" {
 		t.interfaceCallback = t.options.InterfaceMonitor.RegisterCallback(t.routeUpdate)
@@ -371,13 +432,20 @@ func (t *NativeTun) Close() error {
 	if t.options.EXP_ExternalConfiguration {
 		return common.Close(common.PtrOrNil(t.tunFile))
 	}
-	t.unsetSearchDomainForSystemdResolved()
-	t.unsetAddresses()
-	return E.Errors(t.unsetRoute(), t.unsetRules(), common.Close(common.PtrOrNil(t.tunFile)))
+	if t.options.DNSMode != DNSModeDisabled && t.options.NetNs == "" {
+		t.unsetSearchDomainForSystemdResolved()
+	}
+	return E.Errors(runInNetworkNamespace(t.options.NetNs, func() error {
+		t.unsetAddresses()
+		return E.Errors(t.unsetRoute(), t.unsetRules())
+	}), common.Close(common.PtrOrNil(t.tunFile)))
 }
 
 func (t *NativeTun) Read(p []byte) (n int, err error) {
 	if t.vnetHdr {
+		if t.writeBuffer == nil {
+			t.writeBuffer = make([]byte, virtioNetHdrLen+gsoMaxSize)
+		}
 		n, err = t.tunFile.Read(t.writeBuffer)
 		if err != nil {
 			if errors.Is(err, syscall.EBADFD) {
@@ -500,6 +568,9 @@ func (t *NativeTun) BatchRead(buffers [][]byte, offset int, readN []int) (int, e
 		used = count
 	}
 	for used < len(buffers) {
+		if t.writeBuffer == nil {
+			t.writeBuffer = make([]byte, virtioNetHdrLen+gsoMaxSize)
+		}
 		var (
 			readLength int
 			err        error
@@ -563,8 +634,10 @@ func (t *NativeTun) readNonblocking(buffer []byte) (int, error) {
 func (t *NativeTun) BatchWrite(buffers [][]byte, offset int) (int, error) {
 	t.writeAccess.Lock()
 	defer func() {
-		t.tcpGROTable.reset()
-		t.udpGROTable.reset()
+		if t.vnetHdr {
+			t.tcpGROTable.reset()
+			t.udpGROTable.reset()
+		}
 		t.writeAccess.Unlock()
 	}()
 	var (
@@ -601,6 +674,28 @@ func (t *NativeTun) TXChecksumOffload() bool {
 	return t.txChecksumOffload
 }
 
+func (t *NativeTun) rawFileDescriptor() int {
+	return t.tunFd
+}
+
+// os.NewFile registers a non-blocking descriptor with the runtime poller, which then wakes an
+// idle thread for every packet the engine loop is already waiting for on its own epoll.
+func (t *NativeTun) detachRuntimePoller() error {
+	duplicated, err := unix.FcntlInt(uintptr(t.tunFd), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	previous := t.tunFile
+	t.tunFd = duplicated
+	t.tunFile = newUnpolledFile(duplicated, "tun")
+	t.readRawConn, err = t.tunFile.SyscallConn()
+	return E.Errors(err, previous.Close())
+}
+
+func (t *NativeTun) vnetHeaderEnabled() (bool, error) {
+	return checkVNETHDREnabled(t.tunFd, t.options.Name)
+}
+
 func prefixToIPNet(prefix netip.Prefix) *net.IPNet {
 	return &net.IPNet{
 		IP:   prefix.Addr().AsSlice(),
@@ -618,16 +713,18 @@ func (t *NativeTun) UpdateRouteOptions(tunOptions Options) error {
 		t.options = tunOptions
 		return nil
 	}
-	tunLink, err := netlink.LinkByName(t.options.Name)
-	if err != nil {
-		return E.Cause(err, "find tun interface")
-	}
-	err = t.unsetRoute0(tunLink)
-	if err != nil {
-		return E.Cause(err, "unset old routes")
-	}
-	t.options = tunOptions
-	return t.setRoute(tunLink)
+	return runInNetworkNamespace(t.options.NetNs, func() error {
+		tunLink, err := netlink.LinkByName(t.options.Name)
+		if err != nil {
+			return E.Cause(err, "find tun interface")
+		}
+		err = t.unsetRoute0(tunLink)
+		if err != nil {
+			return E.Cause(err, "unset old routes")
+		}
+		t.options = tunOptions
+		return t.setRoute(tunLink)
+	})
 }
 
 func (t *NativeTun) routes(tunLink netlink.Link) ([]netlink.Route, error) {
@@ -706,11 +803,17 @@ func (t *NativeTun) rules() []*netlink.Rule {
 	priority6 := priority
 
 	if t.options.AutoRedirectMarkMode {
+		inputMark := effectiveMark(t.options.AutoRedirectInputMark, DefaultAutoRedirectInputMark, DefaultAutoRedirectInputMarkAndroid)
+		outputMark := effectiveMark(t.options.AutoRedirectOutputMark, DefaultAutoRedirectOutputMark, DefaultAutoRedirectOutputMarkAndroid)
+		resetMark := effectiveMark(t.options.AutoRedirectResetMark, DefaultAutoRedirectResetMark, DefaultAutoRedirectResetMarkAndroid)
+		tproxyMark := effectiveMark(t.options.AutoRedirectTProxyMark, DefaultAutoRedirectTProxyMark, DefaultAutoRedirectTProxyMarkAndroid)
+		markMask := int(inputMark | outputMark | resetMark | tproxyMark)
 		if p4 {
 			it = netlink.NewRule()
 			it.Priority = priority
-			it.Mark = t.options.AutoRedirectOutputMark
+			it.Mark = outputMark
 			it.MarkSet = true
+			it.Mask = markMask
 			it.Goto = priority + 2
 			it.Family = unix.AF_INET
 			rules = append(rules, it)
@@ -718,8 +821,9 @@ func (t *NativeTun) rules() []*netlink.Rule {
 
 			it = netlink.NewRule()
 			it.Priority = priority
-			it.Mark = t.options.AutoRedirectInputMark
+			it.Mark = inputMark
 			it.MarkSet = true
+			it.Mask = markMask
 			it.Table = t.options.IPRoute2TableIndex
 			it.Family = unix.AF_INET
 			rules = append(rules, it)
@@ -733,8 +837,9 @@ func (t *NativeTun) rules() []*netlink.Rule {
 		if p6 {
 			it = netlink.NewRule()
 			it.Priority = priority6
-			it.Mark = t.options.AutoRedirectOutputMark
+			it.Mark = outputMark
 			it.MarkSet = true
+			it.Mask = markMask
 			it.Goto = priority6 + 2
 			it.Family = unix.AF_INET6
 			rules = append(rules, it)
@@ -742,8 +847,9 @@ func (t *NativeTun) rules() []*netlink.Rule {
 
 			it = netlink.NewRule()
 			it.Priority = priority6
-			it.Mark = t.options.AutoRedirectInputMark
+			it.Mark = inputMark
 			it.MarkSet = true
+			it.Mask = markMask
 			it.Table = t.options.IPRoute2TableIndex
 			it.Family = unix.AF_INET6
 			rules = append(rules, it)
@@ -754,11 +860,13 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it.Family = unix.AF_INET6
 			rules = append(rules, it)
 		}
-		// Fallback rules after system default rules (32766: main, 32767: default)
-		// Only reached when main and default tables have no route
 		if p4 {
 			it = netlink.NewRule()
 			it.Priority = t.options.IPRoute2AutoRedirectFallbackRuleIndex
+			it.Mark = outputMark
+			it.MarkSet = true
+			it.Mask = markMask
+			it.Invert = true
 			it.Table = t.options.IPRoute2TableIndex
 			it.Family = unix.AF_INET
 			rules = append(rules, it)
@@ -766,6 +874,10 @@ func (t *NativeTun) rules() []*netlink.Rule {
 		if p6 {
 			it = netlink.NewRule()
 			it.Priority = t.options.IPRoute2AutoRedirectFallbackRuleIndex
+			it.Mark = outputMark
+			it.MarkSet = true
+			it.Mask = markMask
+			it.Invert = true
 			it.Table = t.options.IPRoute2TableIndex
 			it.Family = unix.AF_INET6
 			rules = append(rules, it)
@@ -1024,6 +1136,18 @@ func (t *NativeTun) rules() []*netlink.Rule {
 		it.Goto = nopPriority
 		it.Family = unix.AF_INET6
 		rules = append(rules, it)
+		priority6++
+
+		for _, address := range t.options.Inet6Address {
+			it = netlink.NewRule()
+			it.Priority = priority6
+			it.IifName = "lo"
+			it.Src = address.Masked()
+			it.Table = t.options.IPRoute2TableIndex
+			it.Family = unix.AF_INET6
+			rules = append(rules, it)
+		}
+		priority6++
 
 		it = netlink.NewRule()
 		it.Priority = priority6
@@ -1040,17 +1164,6 @@ func (t *NativeTun) rules() []*netlink.Rule {
 		it.Goto = nopPriority
 		it.Family = unix.AF_INET6
 		rules = append(rules, it)
-		priority6++
-
-		for _, address := range t.options.Inet6Address {
-			it = netlink.NewRule()
-			it.Priority = priority6
-			it.IifName = "lo"
-			it.Src = address.Masked()
-			it.Table = t.options.IPRoute2TableIndex
-			it.Family = unix.AF_INET6
-			rules = append(rules, it)
-		}
 		priority6++
 
 		it = netlink.NewRule()
@@ -1202,35 +1315,23 @@ var ResolveCtl func(args ...string) error = func(args ...string) error {
 	return err
 }
 
-func (t *NativeTun) setSearchDomainForSystemdResolved() {
-	if t.options.EXP_DisableDNSHijack {
-		return
+func (t *NativeTun) setSearchDomainForSystemdResolved() error {
+	_, err := exec.LookPath("resolvectl")
+	if err != nil {
+		return nil
 	}
-	if ResolveCtl() != nil {
-		return
-	}
-	dnsServer := t.options.DNSServers
-	if len(dnsServer) == 0 {
-		if len(t.options.Inet4Address) > 0 && HasNextAddress(t.options.Inet4Address[0], 1) {
-			dnsServer = append(dnsServer, t.options.Inet4Address[0].Addr().Next())
-		}
-		if len(t.options.Inet6Address) > 0 && HasNextAddress(t.options.Inet6Address[0], 1) {
-			dnsServer = append(dnsServer, t.options.Inet6Address[0].Addr().Next())
-		}
-	}
-	if len(dnsServer) == 0 {
-		return
+	dnsAddress, err := t.options.DNSServerAddress()
+	if err != nil {
+		return err
 	}
 	go func() {
 		_ = ResolveCtl("domain", t.options.Name, "~.")
 		_ = ResolveCtl("default-route", t.options.Name, "true")
-		_ = ResolveCtl(append([]string{"dns", t.options.Name}, common.Map(dnsServer, netip.Addr.String)...)...)
+		_ = ResolveCtl(append([]string{"dns", t.options.Name}, common.Map(dnsAddress, netip.Addr.String)...)...)
 	}()
+	return nil
 }
 
 func (t *NativeTun) unsetSearchDomainForSystemdResolved() {
-	if t.options.EXP_DisableDNSHijack {
-		return
-	}
 	_ = ResolveCtl("revert", t.options.Name)
 }

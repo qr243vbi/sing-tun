@@ -4,12 +4,10 @@ package tun
 
 import (
 	"context"
-	"errors"
 	"math"
 	"net/netip"
 	"os"
 	"sync"
-	"time"
 	_ "unsafe"
 
 	"github.com/sagernet/gvisor/pkg/buffer"
@@ -22,35 +20,41 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/udpnat2"
 )
 
 type UDPForwarder struct {
 	ctx     context.Context
 	stack   *stack.Stack
 	handler Handler
-	udpNat  *udpnat.Service
+	udpNat  *UDPNat
 }
 
-func NewUDPForwarder(ctx context.Context, stack *stack.Stack, handler Handler, timeout time.Duration) *UDPForwarder {
+func NewUDPForwarder(ctx context.Context, stack *stack.Stack, handler Handler, options UDPNatOptions) *UDPForwarder {
 	forwarder := &UDPForwarder{
 		ctx:     ctx,
 		stack:   stack,
 		handler: handler,
 	}
-	forwarder.udpNat = udpnat.New(handler, forwarder.PreparePacketConnection, timeout, false)
+	options.Handler = handler
+	options.Prepare = forwarder.PreparePacketConnection
+	forwarder.udpNat = NewUDPNat(options)
 	return forwarder
+}
+
+func (f *UDPForwarder) Start() error {
+	return f.udpNat.Start()
+}
+
+func (f *UDPForwarder) Close() error {
+	return f.udpNat.Close()
 }
 
 func (f *UDPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
 	source := M.SocksaddrFrom(AddrFromAddress(id.RemoteAddress), id.RemotePort)
 	destination := M.SocksaddrFrom(AddrFromAddress(id.LocalAddress), id.LocalPort)
-	bufferRange := pkt.Data().AsRange()
-	var bufferSlices [][]byte
-	rangeIterate(bufferRange, func(view *buffer.View) {
-		bufferSlices = append(bufferSlices, view.AsSlice())
-	})
-	f.udpNat.NewPacket(bufferSlices, source, destination, pkt)
+	data := pkt.Data()
+	payload, _ := data.PullUp(data.Size())
+	f.udpNat.NewPacket([][]byte{payload}, source, destination, pkt)
 	return true
 }
 
@@ -58,18 +62,35 @@ func (f *UDPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pac
 func rangeIterate(r stack.Range, fn func(*buffer.View))
 
 func (f *UDPForwarder) PreparePacketConnection(source M.Socksaddr, destination M.Socksaddr, userData any) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc) {
-	_, pErr := f.handler.PrepareConnection(N.NetworkUDP, source, destination, nil, 0)
-	if pErr != nil {
-		if !errors.Is(pErr, ErrDrop) {
-			gWriteUnreachable(f.stack, userData.(*stack.PacketBuffer))
+	firstPacketBuffer := userData.(*stack.PacketBuffer)
+	var firstPacket []byte
+	rangeIterate(firstPacketBuffer.Data().AsRange(), func(view *buffer.View) {
+		if firstPacket == nil {
+			firstPacket = view.AsSlice()
+		} else {
+			firstPacket = append(firstPacket[:len(firstPacket):len(firstPacket)], view.AsSlice()...)
 		}
-		return false, nil, nil, nil
-	}
+	})
 	var sourceNetwork tcpip.NetworkProtocolNumber
 	if source.Addr.Is4() {
 		sourceNetwork = header.IPv4ProtocolNumber
 	} else {
 		sourceNetwork = header.IPv6ProtocolNumber
+	}
+	switch f.handler.JudgeFlow(uint8(header.UDPProtocolNumber), source.AddrPort(), destination.AddrPort(), firstPacket).Action {
+	case ActionReject:
+		gWriteUnreachable(f.stack, userData.(*stack.PacketBuffer))
+		return false, nil, nil, nil
+	case ActionDrop:
+		return false, nil, nil, nil
+	case ActionHijackDNS:
+		f.handler.NewDNSPacket(firstPacket, source, destination, &UDPBackWriter{
+			stack:         f.stack,
+			source:        AddressFromAddr(source.Addr),
+			sourcePort:    source.Port,
+			sourceNetwork: sourceNetwork,
+		})
+		return false, nil, nil, nil
 	}
 	writer := &UDPBackWriter{
 		stack:         f.stack,

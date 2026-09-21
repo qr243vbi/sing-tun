@@ -50,7 +50,6 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/header"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 	rawfile "github.com/sagernet/sing-tun/internal/rawfile_darwin"
-	"github.com/sagernet/sing/common"
 
 	"golang.org/x/sys/unix"
 )
@@ -200,10 +199,6 @@ type Options struct {
 	// include CapabilitySaveRestore
 	SaveRestore bool
 
-	// DisconnectOk if true, indicates that this NIC capability set should
-	// include CapabilityDisconnectOk.
-	DisconnectOk bool
-
 	// PacketDispatchMode specifies the type of inbound dispatcher to be
 	// used for this endpoint.
 	PacketDispatchMode PacketDispatchMode
@@ -257,10 +252,6 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 		caps |= stack.CapabilitySaveRestore
 	}
 
-	if opts.DisconnectOk {
-		caps |= stack.CapabilityDisconnectOk
-	}
-
 	if len(opts.FDs) == 0 {
 		return nil, fmt.Errorf("opts.FD is empty, at least one FD must be specified")
 	}
@@ -270,7 +261,7 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 	}
 	var batchSize int
 	if opts.MultiPendingPackets {
-		batchSize = int((512*1024)/(opts.MTU)) + 1
+		batchSize = int((512*1024)/opts.MTU) + 1
 	} else {
 		batchSize = 1
 	}
@@ -301,7 +292,7 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 
 		e.fds = append(e.fds, fdInfo{fd: fd, isSocket: true})
 		if opts.ProcessorsPerChannel == 0 {
-			opts.ProcessorsPerChannel = common.Max(1, runtime.GOMAXPROCS(0)/len(opts.FDs))
+			opts.ProcessorsPerChannel = max(1, runtime.GOMAXPROCS(0)/len(opts.FDs))
 		}
 
 		inboundDispatcher, err := newRecvMMsgDispatcher(fd, e, opts)

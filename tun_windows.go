@@ -16,7 +16,6 @@ import (
 	"github.com/sagernet/sing-tun/internal/winipcfg"
 	"github.com/sagernet/sing-tun/internal/winsys"
 	"github.com/sagernet/sing-tun/internal/wintun"
-	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/windnsapi"
 
@@ -81,16 +80,14 @@ func (t *NativeTun) configure() error {
 		if err != nil {
 			return E.Cause(err, "set ipv4 address")
 		}
-		if t.options.AutoRoute && !t.options.EXP_DisableDNSHijack {
-			dnsServers := common.Filter(t.options.DNSServers, netip.Addr.Is4)
-			if len(dnsServers) == 0 && HasNextAddress(t.options.Inet4Address[0], 1) {
-				dnsServers = []netip.Addr{t.options.Inet4Address[0].Addr().Next()}
+		if t.options.AutoRoute && t.options.DNSModeOrDefault() != DNSModeDisabled {
+			dnsServers, err := t.options.Inet4DNSAddress()
+			if err != nil {
+				return err
 			}
-			if len(dnsServers) > 0 {
-				err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET), dnsServers, nil)
-				if err != nil {
-					return E.Cause(err, "set ipv4 dns")
-				}
+			err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET), dnsServers, nil)
+			if err != nil {
+				return E.Cause(err, "set ipv4 dns")
 			}
 		} else {
 			err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET), nil, nil)
@@ -104,16 +101,14 @@ func (t *NativeTun) configure() error {
 		if err != nil {
 			return E.Cause(err, "set ipv6 address")
 		}
-		if t.options.AutoRoute && !t.options.EXP_DisableDNSHijack {
-			dnsServers := common.Filter(t.options.DNSServers, netip.Addr.Is6)
-			if len(dnsServers) == 0 && HasNextAddress(t.options.Inet6Address[0], 1) {
-				dnsServers = []netip.Addr{t.options.Inet6Address[0].Addr().Next()}
+		if t.options.AutoRoute && t.options.DNSModeOrDefault() != DNSModeDisabled {
+			dnsServers, err := t.options.Inet6DNSAddress()
+			if err != nil {
+				return err
 			}
-			if len(dnsServers) > 0 {
-				err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET6), dnsServers, nil)
-				if err != nil {
-					return E.Cause(err, "set ipv6 dns")
-				}
+			err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET6), dnsServers, nil)
+			if err != nil {
+				return E.Cause(err, "set ipv6 dns")
 			}
 		} else {
 			err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET6), nil, nil)
@@ -334,7 +329,7 @@ func (t *NativeTun) Start() error {
 			}
 		}
 
-		if !t.options.EXP_DisableDNSHijack {
+		if t.options.DNSModeOrDefault() == DNSModeHijack {
 			blockDNSCondition := make([]winsys.FWPM_FILTER_CONDITION0, 1)
 			blockDNSCondition[0].FieldKey = winsys.FWPM_CONDITION_IP_REMOTE_PORT
 			blockDNSCondition[0].MatchType = winsys.FWP_MATCH_EQUAL
@@ -386,10 +381,9 @@ retry:
 		if t.close.Load() == 1 {
 			return 0, os.ErrClosed
 		}
-		var packet []byte
-		packet, err = t.session.ReceivePacket()
-		switch err {
-		case nil:
+		packet, errno := t.session.ReceivePacket()
+		switch errno {
+		case 0:
 			n = copy(p, packet)
 			t.session.ReleaseReceivePacket(packet)
 			t.rate.update(uint64(n))
@@ -406,7 +400,7 @@ retry:
 		case windows.ERROR_INVALID_DATA:
 			return 0, errors.New("send ring corrupt")
 		}
-		return 0, fmt.Errorf("read failed: %w", err)
+		return 0, fmt.Errorf("read failed: %w", errno)
 	}
 }
 
@@ -439,9 +433,9 @@ retry:
 			t.running.Done()
 			return nil, nil, os.ErrClosed
 		}
-		packet, err := t.session.ReceivePacket()
-		switch err {
-		case nil:
+		packet, errno := t.session.ReceivePacket()
+		switch errno {
+		case 0:
 			packetSize := len(packet)
 			t.rate.update(uint64(packetSize))
 			return packet, func() {
@@ -463,7 +457,7 @@ retry:
 			return nil, nil, errors.New("send ring corrupt")
 		}
 		t.running.Done()
-		return nil, nil, fmt.Errorf("read failed: %w", err)
+		return nil, nil, fmt.Errorf("read failed: %w", errno)
 	}
 }
 
@@ -480,9 +474,9 @@ retry:
 		if t.close.Load() == 1 {
 			return os.ErrClosed
 		}
-		packet, err := t.session.ReceivePacket()
-		switch err {
-		case nil:
+		packet, errno := t.session.ReceivePacket()
+		switch errno {
+		case 0:
 			packetSize := len(packet)
 			block(packet)
 			t.session.ReleaseReceivePacket(packet)
@@ -500,7 +494,7 @@ retry:
 		case windows.ERROR_INVALID_DATA:
 			return errors.New("send ring corrupt")
 		}
-		return fmt.Errorf("read failed: %w", err)
+		return fmt.Errorf("read failed: %w", errno)
 	}
 }
 
@@ -511,19 +505,19 @@ func (t *NativeTun) Write(p []byte) (n int, err error) {
 		return 0, os.ErrClosed
 	}
 	t.rate.update(uint64(len(p)))
-	packet, err := t.session.AllocateSendPacket(len(p))
+	packet, errno := t.session.AllocateSendPacket(len(p))
 	copy(packet, p)
-	if err == nil {
+	if errno == 0 {
 		t.session.SendPacket(packet)
 		return len(p), nil
 	}
-	switch err {
+	switch errno {
 	case windows.ERROR_HANDLE_EOF:
 		return 0, os.ErrClosed
 	case windows.ERROR_BUFFER_OVERFLOW:
 		return 0, nil // Dropping when ring is full.
 	}
-	return 0, fmt.Errorf("write failed: %w", err)
+	return 0, fmt.Errorf("write failed: %w", errno)
 }
 
 func (t *NativeTun) write(packetElementList [][]byte) (n int, err error) {
@@ -537,8 +531,8 @@ func (t *NativeTun) write(packetElementList [][]byte) (n int, err error) {
 		packetSize += len(packetElement)
 	}
 	t.rate.update(uint64(packetSize))
-	packet, err := t.session.AllocateSendPacket(packetSize)
-	if err == nil {
+	packet, errno := t.session.AllocateSendPacket(packetSize)
+	if errno == 0 {
 		var index int
 		for _, packetElement := range packetElementList {
 			index += copy(packet[index:], packetElement)
@@ -546,13 +540,71 @@ func (t *NativeTun) write(packetElementList [][]byte) (n int, err error) {
 		t.session.SendPacket(packet)
 		return
 	}
-	switch err {
+	switch errno {
 	case windows.ERROR_HANDLE_EOF:
 		return 0, os.ErrClosed
 	case windows.ERROR_BUFFER_OVERFLOW:
 		return 0, nil // Dropping when ring is full.
 	}
-	return 0, fmt.Errorf("write failed: %w", err)
+	return 0, fmt.Errorf("write failed: %w", errno)
+}
+
+func (t *NativeTun) readWaitHandle() windows.Handle {
+	return t.readWait
+}
+
+func (t *NativeTun) receiveInto(buffer []byte) (int, error) {
+	t.running.Add(1)
+	defer t.running.Done()
+	for {
+		if t.close.Load() == 1 {
+			return 0, os.ErrClosed
+		}
+		packet, errno := t.session.ReceivePacket()
+		if errno != 0 {
+			switch errno {
+			case windows.ERROR_NO_MORE_ITEMS:
+				return 0, nil
+			case windows.ERROR_HANDLE_EOF:
+				return 0, os.ErrClosed
+			case windows.ERROR_INVALID_DATA:
+				return 0, E.New("wintun: receive ring corrupt")
+			}
+			return 0, E.Cause(errno, "wintun: receive packet")
+		}
+		if len(packet) > len(buffer) {
+			t.session.ReleaseReceivePacket(packet)
+			continue
+		}
+		n := copy(buffer, packet)
+		t.session.ReleaseReceivePacket(packet)
+		return n, nil
+	}
+}
+
+func (t *NativeTun) transmitGather(segments [][]byte) error {
+	t.running.Add(1)
+	defer t.running.Done()
+	if t.close.Load() == 1 {
+		return os.ErrClosed
+	}
+	var packetSize int
+	for _, segment := range segments {
+		packetSize += len(segment)
+	}
+	packet, errno := t.session.AllocateSendPacket(packetSize)
+	if errno != 0 {
+		if errno == windows.ERROR_HANDLE_EOF {
+			return os.ErrClosed
+		}
+		return errno
+	}
+	var index int
+	for _, segment := range segments {
+		index += copy(packet[index:], segment)
+	}
+	t.session.SendPacket(packet)
+	return nil
 }
 
 func (t *NativeTun) Close() error {
@@ -561,7 +613,9 @@ func (t *NativeTun) Close() error {
 		t.close.Store(1)
 		windows.SetEvent(t.readWait)
 		t.running.Wait()
-		t.session.End()
+		if t.session != (wintun.Session{}) {
+			t.session.End()
+		}
 		t.adapter.Close()
 		if t.fwpmSession != 0 {
 			winsys.FwpmEngineClose0(t.fwpmSession)

@@ -3,10 +3,9 @@
 package tun
 
 import (
-	"context"
-	"errors"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/gvisor/pkg/buffer"
@@ -17,37 +16,84 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv4"
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv6"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
-	"github.com/sagernet/sing/common/buf"
-	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
+	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 )
 
 type ICMPForwarder struct {
-	ctx          context.Context
-	stack        *stack.Stack
-	inet4Address netip.Addr
-	inet6Address netip.Addr
-	handler      Handler
-	mapping      *DirectRouteMapping
+	stack   *stack.Stack
+	handler Handler
+	logger  logger.Logger
+
+	returnPath icmpForwarderReturn
+
+	flowAccess    sync.Mutex
+	flows         map[icmpFlowKey]*icmpFlow
+	lastSweep     time.Time
+	attachedPorts map[Port]bool
 }
 
-func NewICMPForwarder(
-	ctx context.Context,
-	stack *stack.Stack,
-	handler Handler,
-	timeout time.Duration,
-) *ICMPForwarder {
-	return &ICMPForwarder{
-		ctx:     ctx,
-		stack:   stack,
-		handler: handler,
-		mapping: NewDirectRouteMapping(timeout),
+type icmpFlowKey struct {
+	v6          bool
+	source      netip.Addr
+	destination netip.Addr
+	identifier  uint16
+}
+
+type icmpFlow struct {
+	port     Port
+	tracker  FlowTracker
+	deadline time.Time
+	closed   atomic.Bool
+}
+
+func (f *icmpFlow) close(reason FlowCloseReason) {
+	if !f.closed.CompareAndSwap(false, true) {
+		return
+	}
+	if f.tracker != nil {
+		f.tracker.CloseFlow(reason)
 	}
 }
 
-func (f *ICMPForwarder) SetLocalAddresses(inet4Address, inet6Address netip.Addr) {
-	f.inet4Address = inet4Address
-	f.inet6Address = inet6Address
+func (f *icmpFlow) CloseFlow() {
+	f.close(FlowCloseReset)
+}
+
+func NewICMPForwarder(stack *stack.Stack, handler Handler, logger logger.Logger) *ICMPForwarder {
+	forwarder := &ICMPForwarder{
+		stack:         stack,
+		handler:       handler,
+		logger:        logger,
+		flows:         make(map[icmpFlowKey]*icmpFlow),
+		attachedPorts: make(map[Port]bool),
+	}
+	forwarder.returnPath.forwarder = forwarder
+	return forwarder
+}
+
+func (f *ICMPForwarder) Purge() {
+	f.flowAccess.Lock()
+	for key, flow := range f.flows {
+		flow.close(FlowCloseReset)
+		delete(f.flows, key)
+	}
+	f.flowAccess.Unlock()
+}
+
+func (f *ICMPForwarder) Close() error {
+	f.returnPath.closed.Store(true)
+	f.flowAccess.Lock()
+	defer f.flowAccess.Unlock()
+	for key, flow := range f.flows {
+		flow.close(FlowCloseReset)
+		delete(f.flows, key)
+	}
+	for port := range f.attachedPorts {
+		port.DetachReturn(&f.returnPath)
+		delete(f.attachedPorts, port)
+	}
+	return nil
 }
 
 func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
@@ -57,32 +103,26 @@ func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pa
 		if icmpHdr.Type() != header.ICMPv4Echo || icmpHdr.Code() != 0 {
 			return false
 		}
-		sourceAddr := M.AddrFromIP(ipHdr.SourceAddressSlice())
-		destinationAddr := M.AddrFromIP(ipHdr.DestinationAddressSlice())
-		if destinationAddr != f.inet4Address {
-			action, err := f.mapping.Lookup(DirectRouteSession{Source: sourceAddr, Destination: destinationAddr}, func(timeout time.Duration) (DirectRouteDestination, error) {
-				return f.handler.PrepareConnection(
-					N.NetworkICMP,
-					M.SocksaddrFrom(sourceAddr, 0),
-					M.SocksaddrFrom(destinationAddr, 0),
-					&ICMPBackWriter{
-						stack:         f.stack,
-						packet:        pkt,
-						source:        ipHdr.SourceAddress(),
-						sourceNetwork: header.IPv4ProtocolNumber,
-					},
-					timeout,
-				)
-			})
-			if errors.Is(err, ErrReset) {
-				gWriteUnreachable(f.stack, pkt)
-				return true
-			} else if errors.Is(err, ErrDrop) {
-				return true
-			}
-			if action != nil {
-				// TODO: handle error
-				_ = icmpWritePacketBuffer(action, pkt)
+		identifier := icmpHdr.Ident()
+		key := icmpFlowKey{
+			source:      AddrFromAddress(ipHdr.SourceAddress()),
+			destination: AddrFromAddress(ipHdr.DestinationAddress()),
+			identifier:  identifier,
+		}
+		if f.forwardCached(key, pkt) {
+			return true
+		}
+		verdict := f.handler.JudgeFlow(
+			uint8(header.ICMPv4ProtocolNumber),
+			netip.AddrPortFrom(key.source, identifier),
+			netip.AddrPortFrom(key.destination, identifier),
+			nil,
+		)
+		switch verdict.Action {
+		case ActionReject, ActionDrop:
+			return true
+		case ActionFlow, ActionBypass:
+			if f.installFlow(key, verdict, pkt) {
 				return true
 			}
 		}
@@ -95,18 +135,18 @@ func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pa
 		ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
 		outgoingEP, gErr := f.stack.GetNetworkEndpoint(DefaultNIC, header.IPv4ProtocolNumber)
 		if gErr != nil {
-			// TODO: log error
+			f.logger.Error(E.Cause(gonet.TranslateNetstackError(gErr), "get IPv4 network endpoint"))
 			return true
 		}
 		route, gErr := f.stack.FindRoute(
 			DefaultNIC,
 			id.LocalAddress,
 			id.RemoteAddress,
-			header.IPv6ProtocolNumber,
+			header.IPv4ProtocolNumber,
 			false,
 		)
 		if gErr != nil {
-			// TODO: log error
+			f.logger.Error(E.Cause(gonet.TranslateNetstackError(gErr), "find IPv4 route"))
 			return true
 		}
 		defer route.Release()
@@ -115,36 +155,36 @@ func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pa
 	} else {
 		ipHdr := header.IPv6(pkt.NetworkHeader().Slice())
 		icmpHdr := header.ICMPv6(pkt.TransportHeader().Slice())
-		if icmpHdr.Type() != header.ICMPv6EchoRequest || icmpHdr.Code() != 0 {
+		if icmpHdr.Type() != header.ICMPv6EchoRequest {
 			return false
 		}
-		sourceAddr := M.AddrFromIP(ipHdr.SourceAddressSlice())
-		destinationAddr := M.AddrFromIP(ipHdr.DestinationAddressSlice())
-		if destinationAddr != f.inet6Address {
-			action, err := f.mapping.Lookup(DirectRouteSession{Source: sourceAddr, Destination: destinationAddr}, func(timeout time.Duration) (DirectRouteDestination, error) {
-				return f.handler.PrepareConnection(
-					N.NetworkICMP,
-					M.SocksaddrFrom(sourceAddr, 0),
-					M.SocksaddrFrom(destinationAddr, 0),
-					&ICMPBackWriter{
-						stack:         f.stack,
-						packet:        pkt,
-						source:        ipHdr.SourceAddress(),
-						sourceNetwork: header.IPv6ProtocolNumber,
-					},
-					timeout,
-				)
-			})
-			if errors.Is(err, ErrReset) {
-				gWriteUnreachable(f.stack, pkt)
-				return true
-			} else if errors.Is(err, ErrDrop) {
-				return true
-			}
-			if action != nil {
-				// TODO: handle error
-				pkt.IncRef()
-				_ = icmpWritePacketBuffer(action, pkt)
+		if icmpHdr.Code() != 0 {
+			// The IPv6 built-in echo reply path lacks the LocalAddressTemporary
+			// check its IPv4 sibling has, so returning false would make the stack
+			// reply on behalf of arbitrary forwarded destinations.
+			return true
+		}
+		identifier := icmpHdr.Ident()
+		key := icmpFlowKey{
+			v6:          true,
+			source:      AddrFromAddress(ipHdr.SourceAddress()),
+			destination: AddrFromAddress(ipHdr.DestinationAddress()),
+			identifier:  identifier,
+		}
+		if f.forwardCached(key, pkt) {
+			return true
+		}
+		verdict := f.handler.JudgeFlow(
+			uint8(header.ICMPv6ProtocolNumber),
+			netip.AddrPortFrom(key.source, identifier),
+			netip.AddrPortFrom(key.destination, identifier),
+			nil,
+		)
+		switch verdict.Action {
+		case ActionReject, ActionDrop:
+			return true
+		case ActionFlow, ActionBypass:
+			if f.installFlow(key, verdict, pkt) {
 				return true
 			}
 		}
@@ -159,9 +199,9 @@ func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pa
 			PayloadCsum: pkt.Data().Checksum(),
 			PayloadLen:  pkt.Data().Size(),
 		}))
-		outgoingEP, gErr := f.stack.GetNetworkEndpoint(DefaultNIC, header.IPv4ProtocolNumber)
+		outgoingEP, gErr := f.stack.GetNetworkEndpoint(DefaultNIC, header.IPv6ProtocolNumber)
 		if gErr != nil {
-			// TODO: log error
+			f.logger.Error(E.Cause(gonet.TranslateNetstackError(gErr), "get IPv6 network endpoint"))
 			return true
 		}
 		route, gErr := f.stack.FindRoute(
@@ -172,7 +212,7 @@ func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pa
 			false,
 		)
 		if gErr != nil {
-			// TODO: log error
+			f.logger.Error(E.Cause(gonet.TranslateNetstackError(gErr), "find IPv6 route"))
 			return true
 		}
 		defer route.Release()
@@ -181,64 +221,234 @@ func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pa
 	}
 }
 
-type ICMPBackWriter struct {
-	access        sync.Mutex
-	stack         *stack.Stack
-	packet        *stack.PacketBuffer
-	source        tcpip.Address
-	sourceNetwork tcpip.NetworkProtocolNumber
-}
-
-func (w *ICMPBackWriter) WritePacket(p []byte) error {
-	if w.sourceNetwork == header.IPv4ProtocolNumber {
-		route, err := w.stack.FindRoute(
-			DefaultNIC,
-			header.IPv4(p).SourceAddress(),
-			w.source,
-			w.sourceNetwork,
-			false,
-		)
-		if err != nil {
-			return gonet.TranslateNetstackError(err)
-		}
-		defer route.Release()
-		packet := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(p),
-		})
-		defer packet.DecRef()
-		parse.IPv4(packet)
-		err = route.WritePacketDirect(packet)
-		if err != nil {
-			return gonet.TranslateNetstackError(err)
-		}
-	} else {
-		route, err := w.stack.FindRoute(
-			DefaultNIC,
-			header.IPv6(p).SourceAddress(),
-			w.source,
-			w.sourceNetwork,
-			false,
-		)
-		if err != nil {
-			return gonet.TranslateNetstackError(err)
-		}
-		defer route.Release()
-		packet := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(p),
-		})
-		parse.IPv6(packet)
-		defer packet.DecRef()
-		err = route.WritePacketDirect(packet)
-		if err != nil {
-			return gonet.TranslateNetstackError(err)
+func (f *ICMPForwarder) forwardCached(key icmpFlowKey, pkt *stack.PacketBuffer) bool {
+	now := time.Now()
+	f.flowAccess.Lock()
+	flow, loaded := f.flows[key]
+	if loaded {
+		if flow.closed.Load() {
+			delete(f.flows, key)
+			loaded = false
+		} else if now.After(flow.deadline) {
+			delete(f.flows, key)
+			flow.close(FlowCloseTimeout)
+			loaded = false
+		} else {
+			flow.deadline = now.Add(defaultICMPTimeout)
 		}
 	}
-	return nil
+	f.flowAccess.Unlock()
+	if !loaded {
+		return false
+	}
+	f.writeToPort(flow, pkt)
+	return true
 }
 
-func icmpWritePacketBuffer(action DirectRouteDestination, packetBuffer *stack.PacketBuffer) error {
-	packetSlice := packetBuffer.NetworkHeader().Slice()
-	packetSlice = append(packetSlice, packetBuffer.TransportHeader().Slice()...)
-	packetSlice = append(packetSlice, packetBuffer.Data().AsRange().ToSlice()...)
-	return action.WritePacket(buf.As(packetSlice).ToOwned())
+func (f *ICMPForwarder) installFlow(key icmpFlowKey, verdict FlowVerdict, pkt *stack.PacketBuffer) bool {
+	port := verdict.Port
+	if port == nil {
+		return false
+	}
+	inet4Address, inet6Address := port.PortAddresses()
+	portAddress := inet4Address
+	if key.v6 {
+		portAddress = inet6Address
+	}
+	if !portAddress.IsValid() || !portAddress.IsUnspecified() {
+		return false
+	}
+	f.flowAccess.Lock()
+	if !f.attachedPorts[port] {
+		err := port.AttachReturn(&f.returnPath)
+		if err != nil {
+			f.flowAccess.Unlock()
+			f.logger.Trace(E.Cause(err, "attach ICMP return path"))
+			return false
+		}
+		f.attachedPorts[port] = true
+	}
+	now := time.Now()
+	if now.Sub(f.lastSweep) >= defaultICMPTimeout {
+		f.lastSweep = now
+		for flowKey, cachedFlow := range f.flows {
+			if cachedFlow.closed.Load() {
+				delete(f.flows, flowKey)
+			} else if now.After(cachedFlow.deadline) {
+				delete(f.flows, flowKey)
+				cachedFlow.close(FlowCloseTimeout)
+			}
+		}
+	}
+	flow := &icmpFlow{port: port, deadline: now.Add(defaultICMPTimeout)}
+	if verdict.NewTracker != nil {
+		flow.tracker = verdict.NewTracker()
+	}
+	f.flows[key] = flow
+	f.flowAccess.Unlock()
+	if flow.tracker != nil {
+		flow.tracker.AttachFlow(flow)
+	}
+	f.writeToPort(flow, pkt)
+	return true
+}
+
+func (f *ICMPForwarder) writeToPort(flow *icmpFlow, pkt *stack.PacketBuffer) {
+	networkSlice := pkt.NetworkHeader().Slice()
+	transportSlice := pkt.TransportHeader().Slice()
+	dataSlice := pkt.Data().AsRange().ToSlice()
+	packetSlice := make([]byte, 0, len(networkSlice)+len(transportSlice)+len(dataSlice))
+	packetSlice = append(packetSlice, networkSlice...)
+	packetSlice = append(packetSlice, transportSlice...)
+	packetSlice = append(packetSlice, dataSlice...)
+	if flow.tracker != nil {
+		flow.tracker.CountForward(len(packetSlice))
+	}
+	err := flow.port.WritePackets([][]byte{packetSlice})
+	if err != nil {
+		f.logger.Trace(E.Cause(err, "forward ICMP packet"))
+	}
+}
+
+func (f *ICMPForwarder) lookupFlow(key icmpFlowKey) *icmpFlow {
+	f.flowAccess.Lock()
+	defer f.flowAccess.Unlock()
+	flow, loaded := f.flows[key]
+	if !loaded {
+		return nil
+	}
+	if flow.closed.Load() {
+		delete(f.flows, key)
+		return nil
+	}
+	now := time.Now()
+	if now.After(flow.deadline) {
+		delete(f.flows, key)
+		flow.close(FlowCloseTimeout)
+		return nil
+	}
+	flow.deadline = now.Add(defaultICMPTimeout)
+	return flow
+}
+
+type icmpForwarderReturn struct {
+	forwarder *ICMPForwarder
+	closed    atomic.Bool
+}
+
+func (r *icmpForwarderReturn) ReturnHeadroom() int {
+	return 0
+}
+
+func (r *icmpForwarderReturn) ReturnPackets(packets [][]byte) [][]byte {
+	if r.closed.Load() {
+		return packets
+	}
+	unconsumed := packets[:0]
+	for _, packet := range packets {
+		if !r.forwarder.returnPacket(packet) {
+			unconsumed = append(unconsumed, packet)
+		}
+	}
+	return unconsumed
+}
+
+func (f *ICMPForwarder) returnPacket(packet []byte) bool {
+	if len(packet) == 0 {
+		return false
+	}
+	switch header.IPVersion(packet) {
+	case header.IPv4Version:
+		ipHdr := header.IPv4(packet)
+		if !ipHdr.IsValid(len(packet)) || ipHdr.TransportProtocol() != header.ICMPv4ProtocolNumber || len(ipHdr.Payload()) < header.ICMPv4MinimumSize {
+			return false
+		}
+		icmpHdr := header.ICMPv4(ipHdr.Payload())
+		var key icmpFlowKey
+		switch icmpHdr.Type() {
+		case header.ICMPv4EchoReply:
+			key = icmpFlowKey{
+				source:      AddrFromAddress(ipHdr.DestinationAddress()),
+				destination: AddrFromAddress(ipHdr.SourceAddress()),
+				identifier:  icmpHdr.Ident(),
+			}
+		case header.ICMPv4TimeExceeded, header.ICMPv4DstUnreachable:
+			inner := icmpHdr.Payload()
+			if len(inner) < header.IPv4MinimumSize {
+				return false
+			}
+			innerIPHdr := header.IPv4(inner)
+			innerHeaderLength := int(innerIPHdr.HeaderLength())
+			if innerHeaderLength < header.IPv4MinimumSize || len(inner) < innerHeaderLength+header.ICMPv4MinimumSize {
+				return false
+			}
+			if innerIPHdr.TransportProtocol() != header.ICMPv4ProtocolNumber {
+				return false
+			}
+			innerICMPHdr := header.ICMPv4(inner[innerHeaderLength:])
+			key = icmpFlowKey{
+				source:      AddrFromAddress(innerIPHdr.SourceAddress()),
+				destination: AddrFromAddress(innerIPHdr.DestinationAddress()),
+				identifier:  innerICMPHdr.Ident(),
+			}
+		default:
+			return false
+		}
+		flow := f.lookupFlow(key)
+		if flow == nil {
+			return false
+		}
+		if flow.tracker != nil {
+			flow.tracker.CountReverse(len(packet))
+		}
+		return f.writeBack(packet, header.IPv4ProtocolNumber, ipHdr.SourceAddress(), ipHdr.DestinationAddress())
+	case header.IPv6Version:
+		ipHdr := header.IPv6(packet)
+		if !ipHdr.IsValid(len(packet)) || ipHdr.TransportProtocol() != header.ICMPv6ProtocolNumber || len(ipHdr.Payload()) < header.ICMPv6MinimumSize {
+			return false
+		}
+		icmpHdr := header.ICMPv6(ipHdr.Payload())
+		if icmpHdr.Type() != header.ICMPv6EchoReply {
+			return false
+		}
+		key := icmpFlowKey{
+			v6:          true,
+			source:      AddrFromAddress(ipHdr.DestinationAddress()),
+			destination: AddrFromAddress(ipHdr.SourceAddress()),
+			identifier:  icmpHdr.Ident(),
+		}
+		flow := f.lookupFlow(key)
+		if flow == nil {
+			return false
+		}
+		if flow.tracker != nil {
+			flow.tracker.CountReverse(len(packet))
+		}
+		return f.writeBack(packet, header.IPv6ProtocolNumber, ipHdr.SourceAddress(), ipHdr.DestinationAddress())
+	default:
+		return false
+	}
+}
+
+func (f *ICMPForwarder) writeBack(packet []byte, protocol tcpip.NetworkProtocolNumber, localAddress tcpip.Address, remoteAddress tcpip.Address) bool {
+	route, gErr := f.stack.FindRoute(DefaultNIC, localAddress, remoteAddress, protocol, false)
+	if gErr != nil {
+		f.logger.Error(E.Cause(gonet.TranslateNetstackError(gErr), "find route for ICMP reply"))
+		return true
+	}
+	defer route.Release()
+	packetBuffer := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(packet),
+	})
+	defer packetBuffer.DecRef()
+	if protocol == header.IPv4ProtocolNumber {
+		parse.IPv4(packetBuffer)
+	} else {
+		parse.IPv6(packetBuffer)
+	}
+	gErr = route.WritePacketDirect(packetBuffer)
+	if gErr != nil {
+		f.logger.Error(E.Cause(gonet.TranslateNetstackError(gErr), "write ICMP reply"))
+	}
+	return true
 }

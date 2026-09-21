@@ -9,7 +9,7 @@ import (
 	"github.com/sagernet/nftables"
 	"github.com/sagernet/nftables/binaryutil"
 	"github.com/sagernet/nftables/expr"
-	"github.com/sagernet/sing-tun/internal/gtcpip/header"
+	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -30,11 +30,6 @@ func (r *autoRedirect) setupNFTables() error {
 		Family: nftables.TableFamilyINet,
 	})
 
-	err = r.nftablesCreateAddressSets(nft, table, false)
-	if err != nil {
-		return E.Cause(err, "create address sets")
-	}
-
 	err = r.interfaceFinder.Update()
 	if err != nil {
 		return E.Cause(err, "update interfaces")
@@ -54,18 +49,13 @@ func (r *autoRedirect) setupNFTables() error {
 		return E.Cause(err, "create loopback address sets")
 	}
 
-	if r.nfqueueEnabled {
-		err = r.nftablesCreatePreMatchChains(nft, table)
-		if err != nil {
-			return E.Cause(err, "create pre-match chains")
-		}
+	err = r.nftablesCreatePreMatchChains(nft, table)
+	if err != nil {
+		return E.Cause(err, "create pre-match chains")
 	}
 
 	if !r.shouldSkipOutputChain() {
-		outputNATPriority := nftables.ChainPriorityMangle
-		if r.nfqueueEnabled {
-			outputNATPriority = nftables.ChainPriorityRef(*nftables.ChainPriorityMangle + 1)
-		}
+		outputNATPriority := nftables.ChainPriorityRef(*nftables.ChainPriorityMangle + 2)
 		chainOutput := nft.AddChain(&nftables.Chain{
 			Name:     "output",
 			Table:    table,
@@ -88,7 +78,7 @@ func (r *autoRedirect) setupNFTables() error {
 					Name:     "output_route",
 					Table:    table,
 					Hooknum:  nftables.ChainHookOutput,
-					Priority: nftables.ChainPriorityMangle,
+					Priority: outputNATPriority,
 					Type:     nftables.ChainTypeRoute,
 				})
 				err = r.nftablesCreateLoopbackReroute(nft, table, chainOutputRoute)
@@ -100,7 +90,7 @@ func (r *autoRedirect) setupNFTables() error {
 				Name:     "output_udp_icmp",
 				Table:    table,
 				Hooknum:  nftables.ChainHookOutput,
-				Priority: nftables.ChainPriorityMangle,
+				Priority: outputNATPriority,
 				Type:     nftables.ChainTypeRoute,
 			})
 			err = r.nftablesCreateExcludeRules(nft, table, chainOutputUDP)
@@ -135,11 +125,13 @@ func (r *autoRedirect) setupNFTables() error {
 		r.nftablesCreateRedirectPortReject(nft, table, chainInput)
 	}
 
+	preroutingNATPriority := nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 2)
+	preroutingRoutePriority := nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 3)
 	chainPreRouting := nft.AddChain(&nftables.Chain{
 		Name:     "prerouting",
 		Table:    table,
 		Hooknum:  nftables.ChainHookPrerouting,
-		Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 1),
+		Priority: preroutingNATPriority,
 		Type:     nftables.ChainTypeNAT,
 	})
 	err = r.nftablesCreateExcludeRules(nft, table, chainPreRouting)
@@ -158,7 +150,7 @@ func (r *autoRedirect) setupNFTables() error {
 				Name:     "prerouting_filter",
 				Table:    table,
 				Hooknum:  nftables.ChainHookPrerouting,
-				Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 1),
+				Priority: preroutingNATPriority,
 				Type:     nftables.ChainTypeFilter,
 			})
 			err = r.nftablesCreateLoopbackReroute(nft, table, chainPreRoutingFilter)
@@ -170,7 +162,7 @@ func (r *autoRedirect) setupNFTables() error {
 			Name:     "prerouting_udp_icmp",
 			Table:    table,
 			Hooknum:  nftables.ChainHookPrerouting,
-			Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 2),
+			Priority: preroutingRoutePriority,
 			Type:     nftables.ChainTypeFilter,
 		})
 		ipProto := &nftables.Set{
@@ -295,28 +287,42 @@ func (r *autoRedirect) setupNFTables() error {
 	if err != nil {
 		return E.Cause(err, "configure openwrt firewall4")
 	}
-
 	err = nft.Flush()
 	if err != nil {
 		return E.Cause(err, "flush nftables")
 	}
-
-	r.networkListener = r.networkMonitor.RegisterCallback(func() {
-		err = r.nftablesUpdateLocalAddressSet()
-		if err != nil {
-			r.logger.Error("update local address set: ", err)
+	if r.tunOptions.NetNs == "" {
+		r.startDockerFirewallMonitor()
+		err = r.configureDockerFirewall(false)
+		if err != nil && r.logger != nil {
+			r.logger.Warn("configure docker firewall: ", err)
 		}
-		if r.tunOptions.AutoRedirectMarkMode {
-			err = r.updateRedirectRoutes()
-			if err != nil {
-				r.logger.Error("update redirect routes: ", err)
-			}
+	}
+
+	r.registerNetworkCallback(func() {
+		updateErr := runInNetworkNamespace(r.tunOptions.NetNs, r.updateNetworkAddresses)
+		if updateErr != nil {
+			r.logger.Error(updateErr)
 		}
 	})
 	return nil
 }
 
-// TODO: test if this works
+func (r *autoRedirect) updateNetworkAddresses() error {
+	err := r.nftablesUpdateLocalAddressSet()
+	if err != nil {
+		err = E.Cause(err, "update local address set")
+	}
+	if r.tunOptions.AutoRedirectMarkMode {
+		routeErr := r.updateRedirectRoutes()
+		if routeErr != nil {
+			routeErr = E.Cause(routeErr, "update redirect routes")
+		}
+		err = E.Errors(err, routeErr)
+	}
+	return err
+}
+
 func (r *autoRedirect) nftablesUpdateLocalAddressSet() error {
 	err := r.interfaceFinder.Update()
 	if err != nil {
@@ -352,27 +358,9 @@ func (r *autoRedirect) nftablesUpdateLocalAddressSet() error {
 	return nft.Flush()
 }
 
-func (r *autoRedirect) nftablesUpdateRouteAddressSet() error {
-	nft, err := nftables.New()
-	if err != nil {
-		return E.Cause(err, "create nftables connection")
-	}
-	defer nft.CloseLasting()
-	table, err := nft.ListTableOfFamily(r.tableName, nftables.TableFamilyINet)
-	if err != nil {
-		return E.Cause(err, "list nftables table")
-	}
-	err = r.nftablesCreateAddressSets(nft, table, true)
-	if err != nil {
-		return E.Cause(err, "create address sets")
-	}
-	return nft.Flush()
-}
-
 func (r *autoRedirect) cleanupNFTables() {
-	if r.networkListener != nil {
-		r.networkMonitor.UnregisterCallback(r.networkListener)
-	}
+	r.unregisterNetworkCallback()
+	r.stopDockerFirewallMonitor()
 	nft, err := nftables.New()
 	if err != nil {
 		return
@@ -384,9 +372,18 @@ func (r *autoRedirect) cleanupNFTables() {
 	_ = r.configureOpenWRTFirewall4(nft, true)
 	_ = nft.Flush()
 	_ = nft.CloseLasting()
+	if r.tunOptions.NetNs == "" {
+		err = r.configureDockerFirewall(true)
+		if err != nil && r.logger != nil {
+			r.logger.Warn("cleanup docker firewall: ", err)
+		}
+	}
 }
 
 func (r *autoRedirect) nftablesCreatePreMatchChains(nft *nftables.Conn, table *nftables.Table) error {
+	// Every nat chain of a hook is evaluated from the single nat hook netfilter registers at
+	// NF_IP_PRI_NAT_DST, whatever priority the chain itself declares, so a chain that must see the
+	// original destination has to sit below that priority rather than below the redirect chain.
 	chainPreroutingPreMatch := nft.AddChain(&nftables.Chain{
 		Name:     "prerouting_prematch",
 		Table:    table,
@@ -399,13 +396,13 @@ func (r *autoRedirect) nftablesCreatePreMatchChains(nft *nftables.Conn, table *n
 		return err
 	}
 
-	if !r.shouldSkipOutputChain() {
+	if r.tunOptions.AutoRedirectMarkMode && !r.shouldSkipOutputChain() {
 		chainOutputPreMatch := nft.AddChain(&nftables.Chain{
 			Name:     "output_prematch",
 			Table:    table,
 			Hooknum:  nftables.ChainHookOutput,
-			Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityMangle - 1),
-			Type:     nftables.ChainTypeFilter,
+			Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityMangle + 1),
+			Type:     nftables.ChainTypeRoute,
 		})
 		err = r.nftablesAddPreMatchRules(nft, table, chainOutputPreMatch, false)
 		if err != nil {
@@ -417,19 +414,66 @@ func (r *autoRedirect) nftablesCreatePreMatchChains(nft *nftables.Conn, table *n
 }
 
 func (r *autoRedirect) nftablesAddPreMatchRules(nft *nftables.Conn, table *nftables.Table, chain *nftables.Chain, isPrerouting bool) error {
-	ifnameKey := expr.MetaKeyOIFNAME
 	if isPrerouting {
-		ifnameKey = expr.MetaKeyIIFNAME
+		nft.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: chain,
+			Exprs: []expr.Any{
+				&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: nftablesIfname(r.tunOptions.Name)},
+				&expr.Verdict{Kind: expr.VerdictReturn},
+			},
+		})
 	}
 	nft.AddRule(&nftables.Rule{
 		Table: table,
 		Chain: chain,
 		Exprs: []expr.Any{
-			&expr.Meta{Key: ifnameKey, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: nftablesIfname(r.tunOptions.Name)},
+			&expr.Ct{Key: expr.CtKeyDIRECTION, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{1}},
 			&expr.Verdict{Kind: expr.VerdictReturn},
 		},
 	})
+	for _, mark := range []uint32{r.tunOptions.AutoRedirectOutputMark, r.tunOptions.AutoRedirectInputMark} {
+		nft.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: chain,
+			Exprs: []expr.Any{
+				&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(mark)},
+				&expr.Ct{Key: expr.CtKeyMARK, Register: 1, SourceRegister: true},
+				&expr.Counter{},
+				&expr.Verdict{Kind: expr.VerdictReturn},
+			},
+		})
+		nft.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: chain,
+			Exprs: []expr.Any{
+				&expr.Ct{Key: expr.CtKeyMARK, Register: 1},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(mark)},
+				&expr.Meta{Key: expr.MetaKeyMARK, Register: 1, SourceRegister: true},
+				&expr.Counter{},
+				&expr.Verdict{Kind: expr.VerdictReturn},
+			},
+		})
+	}
+
+	if r.enableIPv4 != r.enableIPv6 {
+		disabledFamily := nftables.TableFamilyIPv6
+		if r.enableIPv6 {
+			disabledFamily = nftables.TableFamilyIPv4
+		}
+		nft.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: chain,
+			Exprs: []expr.Any{
+				&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{uint8(disabledFamily)}},
+				&expr.Verdict{Kind: expr.VerdictReturn},
+			},
+		})
+	}
 
 	preMatchProtocols := &nftables.Set{
 		Table:     table,
@@ -464,71 +508,6 @@ func (r *autoRedirect) nftablesAddPreMatchRules(nft *nftables.Conn, table *nftab
 		},
 	})
 
-	// Bypass mark: save to conntrack and return.
-	// When the NFQUEUE handler returns NF_REPEAT with the output mark,
-	// the packet re-enters this chain from the beginning. This rule
-	// catches it, saves the mark to conntrack (so subsequent packets
-	// of the same connection are bypassed via ct mark check below),
-	// and returns.
-	nft.AddRule(&nftables.Rule{
-		Table: table,
-		Chain: chain,
-		Exprs: []expr.Any{
-			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(r.effectiveOutputMark())},
-			&expr.Ct{Key: expr.CtKeyMARK, Register: 1, SourceRegister: true},
-			&expr.Counter{},
-			&expr.Verdict{Kind: expr.VerdictReturn},
-		},
-	})
-
-	// Reset mark: reject with TCP RST.
-	// When the NFQUEUE handler returns NF_REPEAT with the reset mark,
-	// the packet re-enters this chain and is rejected here.
-	nft.AddRule(&nftables.Rule{
-		Table: table,
-		Chain: chain,
-		Exprs: []expr.Any{
-			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
-			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(r.effectiveResetMark())},
-			&expr.Counter{},
-			&expr.Reject{Type: unix.NFT_REJECT_TCP_RST},
-		},
-	})
-
-	// Already-tracked bypass connections: return immediately.
-	nft.AddRule(&nftables.Rule{
-		Table: table,
-		Chain: chain,
-		Exprs: []expr.Any{
-			&expr.Ct{Key: expr.CtKeyMARK, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(r.effectiveOutputMark())},
-			&expr.Verdict{Kind: expr.VerdictReturn},
-		},
-	})
-
-	if r.tunOptions.AutoRedirectMarkMode {
-		nft.AddRule(&nftables.Rule{
-			Table: table,
-			Chain: chain,
-			Exprs: []expr.Any{
-				&expr.Ct{Key: expr.CtKeyMARK, Register: 1},
-				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(r.tunOptions.AutoRedirectInputMark)},
-				&expr.Verdict{Kind: expr.VerdictReturn},
-			},
-		})
-	}
-
-	queueExpression := func() *expr.Queue {
-		return &expr.Queue{
-			Num:  r.effectiveNFQueue(),
-			Flag: expr.QueueFlagBypass,
-		}
-	}
-
-	// TCP SYN: send to NFQUEUE for pre-match evaluation.
 	nft.AddRule(&nftables.Rule{
 		Table: table,
 		Chain: chain,
@@ -549,7 +528,42 @@ func (r *autoRedirect) nftablesAddPreMatchRules(nft *nftables.Conn, table *nftab
 				Mask:           []byte{0x12},
 				Xor:            []byte{0x00},
 			},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x02}},
+			&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{0x02}},
+			&expr.Verdict{Kind: expr.VerdictReturn},
+		},
+	})
+
+	nft.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
+			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(r.tunOptions.AutoRedirectResetMark)},
+			&expr.Counter{},
+			&expr.Reject{Type: unix.NFT_REJECT_TCP_RST},
+		},
+	})
+
+	err = r.nftablesCreateExcludeRules(nft, table, chain)
+	if err != nil {
+		return err
+	}
+
+	queueExpression := func() *expr.Queue {
+		return &expr.Queue{
+			Num:  r.effectiveNFQueue(),
+			Flag: expr.QueueFlagBypass,
+		}
+	}
+
+	nft.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
 			&expr.Counter{},
 			queueExpression(),
 		},

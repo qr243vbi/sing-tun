@@ -4,15 +4,12 @@ package tun
 
 import (
 	"context"
-	"errors"
 	"net/netip"
 	"sync/atomic"
 
-	"github.com/sagernet/sing-tun/internal/gtcpip/header"
+	"github.com/sagernet/sing-tun/gtcpip/header"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
-	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
 
 	"github.com/florianl/go-nfqueue/v2"
 	"github.com/mdlayher/netlink"
@@ -20,42 +17,48 @@ import (
 )
 
 type nfqueueHandler struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	handler    Handler
-	logger     logger.Logger
-	nfq        *nfqueue.Nfqueue
-	queue      uint16
-	outputMark uint32
-	resetMark  uint32
-	closed     atomic.Bool
+	ctx            context.Context
+	cancel         context.CancelFunc
+	handler        AutoRedirectHandler
+	logger         logger.Logger
+	nfq            *nfqueue.Nfqueue
+	queue          uint16
+	inputMark      uint32
+	outputMark     uint32
+	resetMark      uint32
+	tproxyMark     uint32
+	markMask       uint32
+	repeatOnAccept bool
+	closed         atomic.Bool
 }
 
-type nfqueueOptions struct {
-	Context    context.Context
-	Handler    Handler
-	Logger     logger.Logger
-	Queue      uint16
-	OutputMark uint32
-	ResetMark  uint32
+func (h *nfqueueHandler) acceptVerdict(packet preMatchPacket) (verdict int, mark uint32) {
+	if !h.repeatOnAccept {
+		return nfqueue.NfAccept, 0
+	}
+	if packet.protocol != uint8(unix.IPPROTO_TCP) {
+		return nfqueue.NfRepeat, h.inputMark
+	}
+	if packet.destination.Addr().Is6() {
+		if h.tproxyMark != 0 {
+			return nfqueue.NfRepeat, h.tproxyMark
+		}
+		return nfqueue.NfRepeat, h.inputMark
+	}
+	return nfqueue.NfAccept, 0
 }
 
-func newNFQueueHandler(options nfqueueOptions) (*nfqueueHandler, error) {
-	ctx, cancel := context.WithCancel(options.Context)
-	return &nfqueueHandler{
-		ctx:        ctx,
-		cancel:     cancel,
-		handler:    options.Handler,
-		logger:     options.Logger,
-		queue:      options.Queue,
-		outputMark: options.OutputMark,
-		resetMark:  options.ResetMark,
-	}, nil
-}
-
-func (h *nfqueueHandler) setVerdict(packetID uint32, verdict int, mark uint32) {
+func (h *nfqueueHandler) setVerdict(attr nfqueue.Attribute, verdict int, mark uint32) {
+	packetID := *attr.PacketID
 	var err error
 	if mark != 0 {
+		if h.markMask != 0 {
+			var originalMark uint32
+			if attr.Mark != nil {
+				originalMark = *attr.Mark
+			}
+			mark = originalMark&^h.markMask | mark
+		}
 		err = h.nfq.SetVerdictWithOption(packetID, verdict, nfqueue.WithMark(mark))
 	} else {
 		err = h.nfq.SetVerdict(packetID, verdict)
@@ -65,14 +68,17 @@ func (h *nfqueueHandler) setVerdict(packetID uint32, verdict int, mark uint32) {
 	}
 }
 
+// Without a bypass flag every packet a remaining NFQUEUE rule sends to an unbound queue is
+// dropped, so the queue is unbound in Close rather than with the caller's context.
 func (h *nfqueueHandler) Start() error {
+	h.ctx, h.cancel = context.WithCancel(context.Background())
 	config := nfqueue.Config{
 		NfQueue:      h.queue,
 		MaxPacketLen: 0xFFFF,
 		MaxQueueLen:  4096,
 		Copymode:     nfqueue.NfQnlCopyPacket,
 		AfFamily:     unix.AF_UNSPEC,
-		Flags:        nfqueue.NfQaCfgFlagFailOpen | nfqueue.NfQaCfgFlagGSO,
+		Flags:        nfqueue.NfQaCfgFlagGSO,
 	}
 
 	nfq, err := nfqueue.Open(&config)
@@ -105,9 +111,9 @@ const ipv6AuthenticationHeaderIdentifier header.IPv6ExtensionHeaderIdentifier = 
 
 type preMatchPacket struct {
 	protocol    uint8
-	network     string
-	source      M.Socksaddr
-	destination M.Socksaddr
+	source      netip.AddrPort
+	destination netip.AddrPort
+	firstPacket []byte
 }
 
 func parsePreMatchPacket(packet []byte) (preMatchPacket, bool) {
@@ -161,20 +167,23 @@ func parsePreMatchPacket(packet []byte) (preMatchPacket, bool) {
 		if !flags.Contains(header.TCPFlagSyn) || flags.Contains(header.TCPFlagAck) {
 			return preMatchPacket{}, false
 		}
-		parsed.network = N.NetworkTCP
-		parsed.source = M.SocksaddrFrom(source, tcpHdr.SourcePort())
-		parsed.destination = M.SocksaddrFrom(destination, tcpHdr.DestinationPort())
+		parsed.source = netip.AddrPortFrom(source, tcpHdr.SourcePort())
+		parsed.destination = netip.AddrPortFrom(destination, tcpHdr.DestinationPort())
 	case uint8(header.UDPProtocolNumber):
 		if len(transport) < header.UDPMinimumSize {
 			return preMatchPacket{}, false
 		}
 		udpHdr := header.UDP(transport)
-		if int(udpHdr.Length()) < header.UDPMinimumSize {
+		udpLength := int(udpHdr.Length())
+		if udpLength < header.UDPMinimumSize {
 			return preMatchPacket{}, false
 		}
-		parsed.network = N.NetworkUDP
-		parsed.source = M.SocksaddrFrom(source, udpHdr.SourcePort())
-		parsed.destination = M.SocksaddrFrom(destination, udpHdr.DestinationPort())
+		if udpLength < len(transport) {
+			transport = transport[:udpLength]
+		}
+		parsed.source = netip.AddrPortFrom(source, udpHdr.SourcePort())
+		parsed.destination = netip.AddrPortFrom(destination, udpHdr.DestinationPort())
+		parsed.firstPacket = header.UDP(transport).Payload()
 	case uint8(header.ICMPv4ProtocolNumber):
 		if !source.Is4() || len(transport) < header.ICMPv4MinimumSize {
 			return preMatchPacket{}, false
@@ -183,9 +192,9 @@ func parsePreMatchPacket(packet []byte) (preMatchPacket, bool) {
 		if icmpHdr.Type() != header.ICMPv4Echo || icmpHdr.Code() != 0 {
 			return preMatchPacket{}, false
 		}
-		parsed.network = N.NetworkICMP
-		parsed.source = M.SocksaddrFrom(source, 0)
-		parsed.destination = M.SocksaddrFrom(destination, 0)
+		identifier := icmpHdr.Ident()
+		parsed.source = netip.AddrPortFrom(source, identifier)
+		parsed.destination = netip.AddrPortFrom(destination, identifier)
 	case uint8(header.ICMPv6ProtocolNumber):
 		if !source.Is6() || len(transport) < header.ICMPv6MinimumSize {
 			return preMatchPacket{}, false
@@ -194,9 +203,9 @@ func parsePreMatchPacket(packet []byte) (preMatchPacket, bool) {
 		if icmpHdr.Type() != header.ICMPv6EchoRequest || icmpHdr.Code() != 0 {
 			return preMatchPacket{}, false
 		}
-		parsed.network = N.NetworkICMP
-		parsed.source = M.SocksaddrFrom(source, 0)
-		parsed.destination = M.SocksaddrFrom(destination, 0)
+		identifier := icmpHdr.Ident()
+		parsed.source = netip.AddrPortFrom(source, identifier)
+		parsed.destination = netip.AddrPortFrom(destination, identifier)
 	default:
 		return preMatchPacket{}, false
 	}
@@ -256,34 +265,41 @@ func (h *nfqueueHandler) handlePacket(attr nfqueue.Attribute) int {
 		return 0
 	}
 
-	packetID := *attr.PacketID
 	payload := *attr.Payload
 
 	packet, loaded := parsePreMatchPacket(payload)
 	if !loaded {
-		h.setVerdict(packetID, nfqueue.NfAccept, 0)
+		h.setVerdict(attr, nfqueue.NfAccept, 0)
 		return 0
 	}
 
-	_, pErr := h.handler.PrepareConnection(packet.network, packet.source, packet.destination, nil, 0)
+	verdict := h.handler.JudgeFlow(
+		packet.protocol,
+		packet.source,
+		packet.destination,
+		packet.firstPacket,
+	)
 
-	// Use NfRepeat for bypass/reset so the packet re-enters the chain
-	// from the beginning, allowing mark-checking rules to save the mark
-	// to conntrack. NfAccept is a terminal verdict in nftables — it exits
-	// the chain immediately, skipping any rules after the queue statement.
-	switch {
-	case errors.Is(pErr, ErrBypass):
-		h.setVerdict(packetID, nfqueue.NfRepeat, h.outputMark)
-	case errors.Is(pErr, ErrReset):
+	switch verdict.Action {
+	case ActionBypass:
+		h.setVerdict(attr, nfqueue.NfRepeat, h.outputMark)
+	case ActionReject:
 		if packet.protocol == uint8(unix.IPPROTO_TCP) {
-			h.setVerdict(packetID, nfqueue.NfRepeat, h.resetMark)
+			h.setVerdict(attr, nfqueue.NfRepeat, h.resetMark)
 		} else {
-			h.setVerdict(packetID, nfqueue.NfAccept, 0)
+			h.setVerdict(attr, nfqueue.NfRepeat, h.inputMark)
 		}
-	case errors.Is(pErr, ErrDrop):
-		h.setVerdict(packetID, nfqueue.NfDrop, 0)
+	case ActionDrop:
+		h.setVerdict(attr, nfqueue.NfDrop, 0)
+	case ActionFlow, ActionHijackDNS:
+		h.setVerdict(attr, nfqueue.NfRepeat, h.inputMark)
 	default:
-		h.setVerdict(packetID, nfqueue.NfAccept, 0)
+		if packet.protocol == uint8(unix.IPPROTO_TCP) {
+			acceptVerdict, acceptMark := h.acceptVerdict(packet)
+			h.setVerdict(attr, acceptVerdict, acceptMark)
+		} else {
+			h.setVerdict(attr, nfqueue.NfRepeat, h.inputMark)
+		}
 	}
 
 	return 0

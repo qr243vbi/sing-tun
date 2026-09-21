@@ -8,8 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sagernet/sing-tun/internal/gtcpip/header"
-	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
 	M "github.com/sagernet/sing/common/metadata"
@@ -175,7 +174,7 @@ func (c *UnprivilegedConn) Close() error {
 	for _, conn := range c.mapping {
 		_ = conn.Close()
 	}
-	common.ClearMap(c.mapping)
+	clear(c.mapping)
 	return nil
 }
 
