@@ -1222,19 +1222,25 @@ func (t *NativeTun) routeUpdate(_ *control.Interface, flags int) {
 	}
 }
 
-func (t *NativeTun) setSearchDomainForSystemdResolved() error {
-	ctlPath, err := exec.LookPath("resolvectl")
-	if err != nil {
-		return nil
+var ResolveCtl func(args ...string) error = func(args ...string) error {
+	path, err := exec.LookPath("resolvectl")
+	if err == nil {
+		if len(args) > 0 {
+			return shell.Exec(path, args...).Run()
+		}
 	}
+	return err
+}
+
+func (t *NativeTun) setSearchDomainForSystemdResolved() error {
 	dnsAddress, err := t.options.DNSServerAddress()
 	if err != nil {
 		return err
 	}
 	go func() {
-		_ = shell.Exec(ctlPath, "domain", t.options.Name, "~.").Run()
-		_ = shell.Exec(ctlPath, "default-route", t.options.Name, "true").Run()
-		_ = shell.Exec(ctlPath, append([]string{"dns", t.options.Name}, common.Map(dnsAddress, netip.Addr.String)...)...).Run()
+		_ = ResolveCtl("domain", t.options.Name, "~.").Run()
+		_ = ResolveCtl("default-route", t.options.Name, "true").Run()
+		_ = ResolveCtl(append([]string{"dns", t.options.Name}, common.Map(dnsAddress, netip.Addr.String)...)...).Run()
 	}()
 	return nil
 }
@@ -1243,13 +1249,9 @@ func (t *NativeTun) FlushDNSCache() {
 	if t.options.FileDescriptor != 0 || t.options.EXP_ExternalConfiguration || t.options.DNSModeOrDefault() == DNSModeDisabled || t.options.NetNs != "" {
 		return
 	}
-	ctlPath, err := exec.LookPath("resolvectl")
-	if err != nil {
-		return
-	}
 	// systemd-resolved flushes the cache of a link only when the link switches its current DNS server
 	// (link_set_dns_server in resolved-link.c), which a network change never causes for the TUN link.
-	go shell.Exec(ctlPath, "flush-caches").Run()
+	go ResolveCtl("flush-caches").Run()
 }
 
 func (t *NativeTun) unsetSearchDomainForSystemdResolved() {
@@ -1257,5 +1259,5 @@ func (t *NativeTun) unsetSearchDomainForSystemdResolved() {
 	if err != nil {
 		return
 	}
-	_ = shell.Exec(ctlPath, "revert", t.options.Name).Run()
+	_ = ResolveCtl("revert", t.options.Name).Run()
 }
